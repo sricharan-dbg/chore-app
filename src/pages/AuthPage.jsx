@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { motion } from 'framer-motion'
-import { CheckSquare, ArrowRight, Loader2 } from 'lucide-react'
+import { CheckSquare, ArrowRight, Loader2, Mail } from 'lucide-react'
 import { useAuth } from '../hooks/useAuth'
 import toast from 'react-hot-toast'
 
@@ -9,6 +9,7 @@ export default function AuthPage() {
   const [mode, setMode] = useState('signin') // 'signin' | 'signup'
   const [form, setForm] = useState({ name: '', email: '', password: '' })
   const [loading, setLoading] = useState(false)
+  const [awaitingConfirmation, setAwaitingConfirmation] = useState(false)
   const { signIn, signUp } = useAuth()
   const navigate = useNavigate()
   const [params] = useSearchParams()
@@ -22,27 +23,65 @@ export default function AuthPage() {
     if (mode === 'signup' && !form.name.trim()) return
 
     setLoading(true)
-    const fn = mode === 'signup'
-      ? signUp({ name: form.name.trim(), email: form.email, password: form.password })
-      : signIn({ email: form.email, password: form.password })
-
-    const { error } = await fn
-    setLoading(false)
-
-    if (error) {
-      toast.error(error.message || 'Something went wrong')
-      return
-    }
 
     if (mode === 'signup') {
+      const { data, error } = await signUp({ name: form.name.trim(), email: form.email, password: form.password })
+      setLoading(false)
+      if (error) {
+        toast.error(error.message || 'Failed to create account')
+        return
+      }
+      // Supabase returns session=null when email confirmation is required
+      if (!data?.session) {
+        setAwaitingConfirmation(true)
+        return
+      }
       toast.success('Account created! Welcome.')
+      navigate(redirect, { replace: true })
+    } else {
+      const { error } = await signIn({ email: form.email, password: form.password })
+      setLoading(false)
+      if (error) {
+        toast.error(error.message || 'Invalid email or password')
+        return
+      }
+      navigate(redirect, { replace: true })
     }
-    navigate(redirect, { replace: true })
   }
 
   const toggle = () => {
     setMode(m => m === 'signin' ? 'signup' : 'signin')
     setForm({ name: '', email: '', password: '' })
+    setAwaitingConfirmation(false)
+  }
+
+  // Email confirmation pending state
+  if (awaitingConfirmation) {
+    return (
+      <div className="min-h-screen bg-[#0c0c0c] flex items-center justify-center p-6">
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="w-full max-w-sm text-center"
+        >
+          <div className="w-14 h-14 rounded-xl mx-auto mb-5 flex items-center justify-center"
+            style={{ background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.2)' }}>
+            <Mail size={22} className="text-[#10b981]" />
+          </div>
+          <h2 className="text-[20px] font-semibold text-white mb-2">Check your inbox</h2>
+          <p className="text-[13.5px] text-[#666666] leading-relaxed mb-6">
+            We sent a confirmation link to <span className="text-white">{form.email}</span>.
+            Click it to activate your account, then come back and sign in.
+          </p>
+          <button
+            className="btn btn-secondary w-full"
+            onClick={() => { setAwaitingConfirmation(false); setMode('signin') }}
+          >
+            Back to sign in
+          </button>
+        </motion.div>
+      </div>
+    )
   }
 
   return (
