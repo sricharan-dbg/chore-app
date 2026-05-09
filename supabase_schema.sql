@@ -1,35 +1,38 @@
 -- ============================================================
 -- ChoreOS v2 — Run this in Supabase SQL Editor
--- Safe on both fresh databases and v1 migrations
+-- Safe on both fresh databases and existing v1 projects
 -- ============================================================
 
--- Step 1: Drop v1 triggers/functions safely (tables may not exist yet)
+-- Step 1: Drop old triggers safely (tables may not exist on fresh DB)
 DO $$
 BEGIN
-  -- Drop trigger on auth.users (always exists)
   DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 
-  -- Drop trigger on workspaces only if that table exists
-  IF EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'workspaces' AND relkind = 'r') THEN
+  IF EXISTS (
+    SELECT 1 FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'workspaces' AND n.nspname = 'public' AND c.relkind = 'r'
+  ) THEN
     DROP TRIGGER IF EXISTS on_workspace_created ON workspaces;
   END IF;
 END;
 $$;
 
-DROP FUNCTION IF EXISTS handle_new_user() CASCADE;
-DROP FUNCTION IF EXISTS handle_new_workspace() CASCADE;
+-- Step 2: Drop old functions
+DROP FUNCTION IF EXISTS handle_new_user()          CASCADE;
+DROP FUNCTION IF EXISTS handle_new_workspace()     CASCADE;
 DROP FUNCTION IF EXISTS join_workspace_by_token(text) CASCADE;
-DROP FUNCTION IF EXISTS get_workspace_by_token(text) CASCADE;
+DROP FUNCTION IF EXISTS get_workspace_by_token(text)  CASCADE;
 
--- Step 2: Drop v1 tables (cascade removes dependent policies/indexes)
+-- Step 3: Drop v1 tables if migrating
 DROP TABLE IF EXISTS chore_assignments CASCADE;
-DROP TABLE IF EXISTS chores CASCADE;
-DROP TABLE IF EXISTS members CASCADE;
+DROP TABLE IF EXISTS chores            CASCADE;
+DROP TABLE IF EXISTS members           CASCADE;
 
--- Step 3: Create tables in dependency order
+-- ============================================================
+-- Step 4: Create tables
 -- ============================================================
 
--- User profiles (extends Supabase auth.users)
 CREATE TABLE IF NOT EXISTS profiles (
   id           uuid        PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   name         text        NOT NULL DEFAULT '',
@@ -38,7 +41,6 @@ CREATE TABLE IF NOT EXISTS profiles (
   updated_at   timestamptz DEFAULT now()
 );
 
--- Workspaces
 CREATE TABLE IF NOT EXISTS workspaces (
   id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   name         text        NOT NULL,
@@ -48,7 +50,6 @@ CREATE TABLE IF NOT EXISTS workspaces (
   created_at   timestamptz DEFAULT now()
 );
 
--- Workspace membership / access control
 CREATE TABLE IF NOT EXISTS workspace_members (
   id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id uuid        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -58,7 +59,6 @@ CREATE TABLE IF NOT EXISTS workspace_members (
   UNIQUE (workspace_id, user_id)
 );
 
--- Tasks (scoped to a workspace)
 CREATE TABLE IF NOT EXISTS tasks (
   id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id    uuid        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -75,7 +75,6 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at      timestamptz DEFAULT now()
 );
 
--- Task assignees (workspace members assigned to a task)
 CREATE TABLE IF NOT EXISTS task_assignees (
   id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -83,16 +82,18 @@ CREATE TABLE IF NOT EXISTS task_assignees (
   UNIQUE (task_id, user_id)
 );
 
--- Step 4: Enable Row Level Security
+-- ============================================================
+-- Step 5: Row Level Security
 -- ============================================================
 
-ALTER TABLE profiles         ENABLE ROW LEVEL SECURITY;
-ALTER TABLE workspaces       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profiles          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspaces        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
-ALTER TABLE tasks            ENABLE ROW LEVEL SECURITY;
-ALTER TABLE task_assignees   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_assignees    ENABLE ROW LEVEL SECURITY;
 
--- Step 5: Drop any pre-existing policies then recreate
+-- ============================================================
+-- Step 6: Policies
 -- ============================================================
 
 -- profiles
@@ -100,9 +101,11 @@ DROP POLICY IF EXISTS profiles_select ON profiles;
 DROP POLICY IF EXISTS profiles_insert ON profiles;
 DROP POLICY IF EXISTS profiles_update ON profiles;
 
+-- All authenticated users can read any profile (needed to show names/avatars)
 CREATE POLICY profiles_select ON profiles
   FOR SELECT TO authenticated USING (true);
 
+-- Users can only insert/update their own profile row
 CREATE POLICY profiles_insert ON profiles
   FOR INSERT TO authenticated WITH CHECK (auth.uid() = id);
 
@@ -118,9 +121,7 @@ DROP POLICY IF EXISTS workspaces_delete ON workspaces;
 CREATE POLICY workspaces_select ON workspaces
   FOR SELECT TO authenticated USING (
     owner_id = auth.uid()
-    OR id IN (
-      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-    )
+    OR id IN (SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid())
   );
 
 CREATE POLICY workspaces_insert ON workspaces
@@ -151,9 +152,7 @@ CREATE POLICY wm_insert ON workspace_members
 CREATE POLICY wm_delete ON workspace_members
   FOR DELETE TO authenticated USING (
     user_id = auth.uid()
-    OR workspace_id IN (
-      SELECT id FROM workspaces WHERE owner_id = auth.uid()
-    )
+    OR workspace_id IN (SELECT id FROM workspaces WHERE owner_id = auth.uid())
   );
 
 -- tasks
@@ -236,41 +235,42 @@ CREATE POLICY ta_delete ON task_assignees
     )
   );
 
--- Step 6: Functions (security definer — bypass RLS for invite flow)
+-- ============================================================
+-- Step 7: Helper functions (SECURITY DEFINER for invite flow)
 -- ============================================================
 
--- Returns workspace info by invite token (no auth required for the lookup itself)
 CREATE OR REPLACE FUNCTION get_workspace_by_token(p_token text)
 RETURNS TABLE(id uuid, name text, description text)
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public
 AS $$
 BEGIN
   RETURN QUERY
     SELECT w.id, w.name, w.description
-    FROM workspaces w
+    FROM public.workspaces w
     WHERE w.invite_token = p_token;
 END;
 $$;
 
--- Adds calling user to workspace via invite token
 CREATE OR REPLACE FUNCTION join_workspace_by_token(p_token text)
 RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public
 AS $$
 DECLARE
   v_workspace_id uuid;
 BEGIN
   SELECT w.id INTO v_workspace_id
-  FROM workspaces w
+  FROM public.workspaces w
   WHERE w.invite_token = p_token;
 
   IF v_workspace_id IS NULL THEN
     RAISE EXCEPTION 'Invalid invite token';
   END IF;
 
-  INSERT INTO workspace_members (workspace_id, user_id, role)
+  INSERT INTO public.workspace_members (workspace_id, user_id, role)
   VALUES (v_workspace_id, auth.uid(), 'member')
   ON CONFLICT (workspace_id, user_id) DO NOTHING;
 
@@ -278,23 +278,38 @@ BEGIN
 END;
 $$;
 
--- Step 7: Triggers
+-- ============================================================
+-- Step 8: Trigger functions
+-- Key fixes vs previous versions:
+--   1. SET search_path = public  (required for SECURITY DEFINER in Supabase)
+--   2. EXCEPTION block           (prevents trigger crash from blocking signup)
+--   3. Explicit public. schema prefix on table references
 -- ============================================================
 
--- Auto-create profile row when a user signs up
 CREATE OR REPLACE FUNCTION handle_new_user()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public
 AS $$
 BEGIN
-  INSERT INTO profiles (id, name)
+  INSERT INTO public.profiles (id, name)
   VALUES (
     NEW.id,
-    COALESCE(NEW.raw_user_meta_data->>'name', split_part(NEW.email, '@', 1))
+    COALESCE(
+      NULLIF(TRIM(NEW.raw_user_meta_data->>'name'), ''),
+      split_part(NEW.email, '@', 1)
+    )
   )
   ON CONFLICT (id) DO NOTHING;
+
   RETURN NEW;
+EXCEPTION
+  WHEN others THEN
+    -- Never block user creation due to profile insert errors.
+    -- The client will upsert the profile after login.
+    RAISE WARNING 'handle_new_user: could not create profile for %, error: %', NEW.id, SQLERRM;
+    RETURN NEW;
 END;
 $$;
 
@@ -302,17 +317,24 @@ CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users
   FOR EACH ROW EXECUTE PROCEDURE handle_new_user();
 
--- Auto-add workspace creator as owner-member
+-- -------------------------------------------------------
+
 CREATE OR REPLACE FUNCTION handle_new_workspace()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public
 AS $$
 BEGIN
-  INSERT INTO workspace_members (workspace_id, user_id, role)
+  INSERT INTO public.workspace_members (workspace_id, user_id, role)
   VALUES (NEW.id, NEW.owner_id, 'owner')
   ON CONFLICT (workspace_id, user_id) DO NOTHING;
+
   RETURN NEW;
+EXCEPTION
+  WHEN others THEN
+    RAISE WARNING 'handle_new_workspace: error for workspace %, error: %', NEW.id, SQLERRM;
+    RETURN NEW;
 END;
 $$;
 

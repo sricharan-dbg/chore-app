@@ -31,13 +31,37 @@ export function AuthProvider({ children }) {
     if (data) setProfile(data)
   }
 
+  // Upsert profile — called after signup to handle cases where the DB trigger
+  // didn't fire or ran before the session was established
+  const ensureProfile = async (userId, name, email) => {
+    const displayName = name?.trim() || email?.split('@')[0] || 'User'
+    const { error } = await supabase
+      .from('profiles')
+      .upsert({ id: userId, name: displayName }, { onConflict: 'id' })
+    if (!error) {
+      const { data } = await supabase.from('profiles').select('*').eq('id', userId).single()
+      if (data) setProfile(data)
+    }
+    return { error }
+  }
+
   const signUp = async ({ name, email, password }) => {
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { name } },
+      options: { data: { name: name?.trim() } },
     })
-    return { data, error }
+
+    if (error) return { data: null, error }
+
+    // When email confirmation is disabled, we get a session immediately.
+    // Upsert the profile client-side as a fallback in case the DB trigger
+    // didn't run correctly.
+    if (data?.session && data?.user) {
+      await ensureProfile(data.user.id, name, email)
+    }
+
+    return { data, error: null }
   }
 
   const signIn = async ({ email, password }) => {
