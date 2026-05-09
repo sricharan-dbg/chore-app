@@ -24,7 +24,7 @@ export default function DashboardPage() {
       description: createForm.description.trim(),
     })
     setCreating(false)
-    if (error) { toast.error('Failed to create workspace'); return }
+    if (error) { toast.error(error.message || 'Failed to create workspace'); return }
     setShowCreate(false)
     setCreateForm({ name: '', description: '' })
     toast.success('Workspace created')

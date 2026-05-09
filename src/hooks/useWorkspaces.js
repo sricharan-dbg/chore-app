@@ -31,6 +31,17 @@ export function useWorkspaces() {
       .select()
       .single()
     if (error) return { error }
+
+    // Ensure the owner row exists in workspace_members.
+    // The DB trigger should handle this, but if it ran before workspace_members
+    // was created (partial schema) or failed silently, we add it client-side.
+    await supabase
+      .from('workspace_members')
+      .upsert(
+        { workspace_id: data.id, user_id: user.id, role: 'owner' },
+        { onConflict: 'workspace_id,user_id' }
+      )
+
     await fetch()
     return { data }
   }
