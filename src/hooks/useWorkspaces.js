@@ -39,7 +39,7 @@ export function useWorkspaces() {
       .from('workspace_members')
       .upsert(
         { workspace_id: data.id, user_id: user.id, role: 'owner' },
-        { onConflict: 'workspace_id,user_id' }
+        { onConflict: 'workspace_id,user_id', ignoreDuplicates: true }
       )
 
     await fetch()

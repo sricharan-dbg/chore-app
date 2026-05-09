@@ -93,7 +93,28 @@ ALTER TABLE tasks              ENABLE ROW LEVEL SECURITY;
 ALTER TABLE task_assignees    ENABLE ROW LEVEL SECURITY;
 
 -- ============================================================
--- Step 6: Policies
+-- Step 6a: Helper function for RLS (must exist before policies)
+-- ============================================================
+
+-- Returns the workspace IDs the current user is a member of.
+-- SECURITY DEFINER runs as postgres (bypasses RLS), preventing the
+-- "infinite recursion detected" error that occurs when a policy on
+-- workspace_members queries workspace_members inside itself.
+DROP FUNCTION IF EXISTS user_workspace_ids();
+CREATE OR REPLACE FUNCTION user_workspace_ids()
+RETURNS SETOF uuid
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = public
+AS $$
+  SELECT workspace_id
+  FROM public.workspace_members
+  WHERE user_id = auth.uid();
+$$;
+
+-- ============================================================
+-- Step 6b: Policies
 -- ============================================================
 
 -- profiles
@@ -121,7 +142,7 @@ DROP POLICY IF EXISTS workspaces_delete ON workspaces;
 CREATE POLICY workspaces_select ON workspaces
   FOR SELECT TO authenticated USING (
     owner_id = auth.uid()
-    OR id IN (SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid())
+    OR id IN (SELECT user_workspace_ids())
   );
 
 CREATE POLICY workspaces_insert ON workspaces
@@ -140,10 +161,7 @@ DROP POLICY IF EXISTS wm_delete ON workspace_members;
 
 CREATE POLICY wm_select ON workspace_members
   FOR SELECT TO authenticated USING (
-    user_id = auth.uid()
-    OR workspace_id IN (
-      SELECT workspace_id FROM workspace_members wm2 WHERE wm2.user_id = auth.uid()
-    )
+    workspace_id IN (SELECT user_workspace_ids())
   );
 
 CREATE POLICY wm_insert ON workspace_members
@@ -163,38 +181,22 @@ DROP POLICY IF EXISTS tasks_delete ON tasks;
 
 CREATE POLICY tasks_select ON tasks
   FOR SELECT TO authenticated USING (
-    workspace_id IN (
-      SELECT id FROM workspaces WHERE owner_id = auth.uid()
-      UNION
-      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-    )
+    workspace_id IN (SELECT user_workspace_ids())
   );
 
 CREATE POLICY tasks_insert ON tasks
   FOR INSERT TO authenticated WITH CHECK (
-    workspace_id IN (
-      SELECT id FROM workspaces WHERE owner_id = auth.uid()
-      UNION
-      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-    )
+    workspace_id IN (SELECT user_workspace_ids())
   );
 
 CREATE POLICY tasks_update ON tasks
   FOR UPDATE TO authenticated USING (
-    workspace_id IN (
-      SELECT id FROM workspaces WHERE owner_id = auth.uid()
-      UNION
-      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-    )
+    workspace_id IN (SELECT user_workspace_ids())
   );
 
 CREATE POLICY tasks_delete ON tasks
   FOR DELETE TO authenticated USING (
-    workspace_id IN (
-      SELECT id FROM workspaces WHERE owner_id = auth.uid()
-      UNION
-      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-    )
+    workspace_id IN (SELECT user_workspace_ids())
   );
 
 -- task_assignees
@@ -205,33 +207,21 @@ DROP POLICY IF EXISTS ta_delete ON task_assignees;
 CREATE POLICY ta_select ON task_assignees
   FOR SELECT TO authenticated USING (
     task_id IN (
-      SELECT id FROM tasks WHERE workspace_id IN (
-        SELECT id FROM workspaces WHERE owner_id = auth.uid()
-        UNION
-        SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-      )
+      SELECT id FROM tasks WHERE workspace_id IN (SELECT user_workspace_ids())
     )
   );
 
 CREATE POLICY ta_insert ON task_assignees
   FOR INSERT TO authenticated WITH CHECK (
     task_id IN (
-      SELECT id FROM tasks WHERE workspace_id IN (
-        SELECT id FROM workspaces WHERE owner_id = auth.uid()
-        UNION
-        SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-      )
+      SELECT id FROM tasks WHERE workspace_id IN (SELECT user_workspace_ids())
     )
   );
 
 CREATE POLICY ta_delete ON task_assignees
   FOR DELETE TO authenticated USING (
     task_id IN (
-      SELECT id FROM tasks WHERE workspace_id IN (
-        SELECT id FROM workspaces WHERE owner_id = auth.uid()
-        UNION
-        SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
-      )
+      SELECT id FROM tasks WHERE workspace_id IN (SELECT user_workspace_ids())
     )
   );
 
