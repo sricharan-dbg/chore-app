@@ -1,17 +1,21 @@
 import { getAvatarColor, initials } from '../lib/colors'
 
-export default function Avatar({ name = '', size = 28, className = '' }) {
-  const bg = getAvatarColor(name)
-  const sz = `${size}px`
+export default function Avatar({ name = '', size = 28, color, className = '' }) {
+  const bg = color || getAvatarColor(name)
+  const fontSize = Math.max(9, Math.round(size * 0.36))
+
   return (
     <div
-      className={`flex items-center justify-center rounded-full font-semibold select-none flex-shrink-0 ${className}`}
+      className={`rounded-full flex items-center justify-center font-semibold flex-shrink-0 select-none ${className}`}
       style={{
-        width: sz, height: sz, minWidth: sz,
+        width: size,
+        height: size,
+        minWidth: size,
         background: `${bg}22`,
-        border: `1.5px solid ${bg}66`,
+        border: `1.5px solid ${bg}55`,
         color: bg,
-        fontSize: size < 28 ? 10 : 12,
+        fontSize,
+        letterSpacing: '-0.01em',
       }}
       title={name}
     >
