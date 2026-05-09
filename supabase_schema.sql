@@ -1,239 +1,321 @@
 -- ============================================================
 -- ChoreOS v2 — Run this in Supabase SQL Editor
--- Drop old tables first if migrating from v1
+-- Safe on both fresh databases and v1 migrations
 -- ============================================================
 
--- Drop old tables (v1)
-drop table if exists chore_assignments cascade;
-drop table if exists chores cascade;
-drop table if exists members cascade;
+-- Step 1: Drop v1 triggers/functions safely (tables may not exist yet)
+DO $$
+BEGIN
+  -- Drop trigger on auth.users (always exists)
+  DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 
--- Drop old triggers
-drop trigger if exists on_auth_user_created on auth.users;
-drop trigger if exists on_workspace_created on workspaces;
-drop function if exists handle_new_user();
-drop function if exists handle_new_workspace();
-drop function if exists join_workspace_by_token(text);
-drop function if exists get_workspace_by_token(text);
+  -- Drop trigger on workspaces only if that table exists
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relname = 'workspaces' AND relkind = 'r') THEN
+    DROP TRIGGER IF EXISTS on_workspace_created ON workspaces;
+  END IF;
+END;
+$$;
 
--- ============================================================
--- TABLES
+DROP FUNCTION IF EXISTS handle_new_user() CASCADE;
+DROP FUNCTION IF EXISTS handle_new_workspace() CASCADE;
+DROP FUNCTION IF EXISTS join_workspace_by_token(text) CASCADE;
+DROP FUNCTION IF EXISTS get_workspace_by_token(text) CASCADE;
+
+-- Step 2: Drop v1 tables (cascade removes dependent policies/indexes)
+DROP TABLE IF EXISTS chore_assignments CASCADE;
+DROP TABLE IF EXISTS chores CASCADE;
+DROP TABLE IF EXISTS members CASCADE;
+
+-- Step 3: Create tables in dependency order
 -- ============================================================
 
 -- User profiles (extends Supabase auth.users)
-create table if not exists profiles (
-  id uuid primary key references auth.users(id) on delete cascade,
-  name text not null default '',
-  avatar_color text default '#10b981',
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+CREATE TABLE IF NOT EXISTS profiles (
+  id           uuid        PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  name         text        NOT NULL DEFAULT '',
+  avatar_color text        DEFAULT '#10b981',
+  created_at   timestamptz DEFAULT now(),
+  updated_at   timestamptz DEFAULT now()
 );
 
--- Workspaces (private by default)
-create table if not exists workspaces (
-  id uuid primary key default gen_random_uuid(),
-  name text not null,
-  description text default '',
-  owner_id uuid references auth.users(id) on delete cascade not null,
-  invite_token text unique default encode(gen_random_bytes(16), 'hex'),
-  created_at timestamptz default now()
+-- Workspaces
+CREATE TABLE IF NOT EXISTS workspaces (
+  id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  name         text        NOT NULL,
+  description  text        DEFAULT '',
+  owner_id     uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  invite_token text        UNIQUE DEFAULT encode(gen_random_bytes(16), 'hex'),
+  created_at   timestamptz DEFAULT now()
 );
 
--- Workspace access control
-create table if not exists workspace_members (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid references workspaces(id) on delete cascade not null,
-  user_id uuid references auth.users(id) on delete cascade not null,
-  role text default 'member' check (role in ('owner', 'member')),
-  joined_at timestamptz default now(),
-  unique(workspace_id, user_id)
+-- Workspace membership / access control
+CREATE TABLE IF NOT EXISTS workspace_members (
+  id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id uuid        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id      uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  role         text        DEFAULT 'member' CHECK (role IN ('owner', 'member')),
+  joined_at    timestamptz DEFAULT now(),
+  UNIQUE (workspace_id, user_id)
 );
 
--- Tasks (scoped to workspace)
-create table if not exists tasks (
-  id uuid primary key default gen_random_uuid(),
-  workspace_id uuid references workspaces(id) on delete cascade not null,
-  title text not null,
-  description text default '',
-  due_date date,
-  priority text default 'medium' check (priority in ('low', 'medium', 'high')),
-  color_index integer default 0,
-  recurrence_type text default 'none',
-  custom_days integer[] default '{}',
-  completed boolean default false,
-  created_by uuid references auth.users(id),
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
+-- Tasks (scoped to a workspace)
+CREATE TABLE IF NOT EXISTS tasks (
+  id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id    uuid        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  title           text        NOT NULL,
+  description     text        DEFAULT '',
+  due_date        date,
+  priority        text        DEFAULT 'medium' CHECK (priority IN ('low', 'medium', 'high')),
+  color_index     integer     DEFAULT 0,
+  recurrence_type text        DEFAULT 'none',
+  custom_days     integer[]   DEFAULT '{}',
+  completed       boolean     DEFAULT false,
+  created_by      uuid        REFERENCES auth.users(id),
+  created_at      timestamptz DEFAULT now(),
+  updated_at      timestamptz DEFAULT now()
 );
 
--- Task assignees (references workspace members via user_id)
-create table if not exists task_assignees (
-  id uuid primary key default gen_random_uuid(),
-  task_id uuid references tasks(id) on delete cascade not null,
-  user_id uuid references auth.users(id) on delete cascade not null,
-  unique(task_id, user_id)
+-- Task assignees (workspace members assigned to a task)
+CREATE TABLE IF NOT EXISTS task_assignees (
+  id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  UNIQUE (task_id, user_id)
 );
 
+-- Step 4: Enable Row Level Security
 -- ============================================================
--- RLS
+
+ALTER TABLE profiles         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspaces       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tasks            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_assignees   ENABLE ROW LEVEL SECURITY;
+
+-- Step 5: Drop any pre-existing policies then recreate
 -- ============================================================
 
-alter table profiles enable row level security;
-alter table workspaces enable row level security;
-alter table workspace_members enable row level security;
-alter table tasks enable row level security;
-alter table task_assignees enable row level security;
+-- profiles
+DROP POLICY IF EXISTS profiles_select ON profiles;
+DROP POLICY IF EXISTS profiles_insert ON profiles;
+DROP POLICY IF EXISTS profiles_update ON profiles;
 
--- Profiles: readable by all authenticated users, editable by owner
-create policy "profiles_select" on profiles for select to authenticated using (true);
-create policy "profiles_insert" on profiles for insert to authenticated with check (auth.uid() = id);
-create policy "profiles_update" on profiles for update to authenticated using (auth.uid() = id);
+CREATE POLICY profiles_select ON profiles
+  FOR SELECT TO authenticated USING (true);
 
--- Workspaces: only visible to members
-create policy "workspaces_select" on workspaces for select to authenticated using (
-  owner_id = auth.uid() or
-  id in (select workspace_id from workspace_members where user_id = auth.uid())
-);
-create policy "workspaces_insert" on workspaces for insert to authenticated with check (owner_id = auth.uid());
-create policy "workspaces_update" on workspaces for update to authenticated using (owner_id = auth.uid());
-create policy "workspaces_delete" on workspaces for delete to authenticated using (owner_id = auth.uid());
+CREATE POLICY profiles_insert ON profiles
+  FOR INSERT TO authenticated WITH CHECK (auth.uid() = id);
 
--- Workspace members: visible to members of same workspace
-create policy "wm_select" on workspace_members for select to authenticated using (
-  user_id = auth.uid() or
-  workspace_id in (select workspace_id from workspace_members wm2 where wm2.user_id = auth.uid())
-);
-create policy "wm_insert" on workspace_members for insert to authenticated with check (user_id = auth.uid());
-create policy "wm_delete" on workspace_members for delete to authenticated using (
-  user_id = auth.uid() or
-  workspace_id in (select id from workspaces where owner_id = auth.uid())
-);
+CREATE POLICY profiles_update ON profiles
+  FOR UPDATE TO authenticated USING (auth.uid() = id);
 
--- Tasks: visible only to workspace members
-create policy "tasks_select" on tasks for select to authenticated using (
-  workspace_id in (
-    select id from workspaces where owner_id = auth.uid()
-    union
-    select workspace_id from workspace_members where user_id = auth.uid()
-  )
-);
-create policy "tasks_insert" on tasks for insert to authenticated with check (
-  workspace_id in (
-    select id from workspaces where owner_id = auth.uid()
-    union
-    select workspace_id from workspace_members where user_id = auth.uid()
-  )
-);
-create policy "tasks_update" on tasks for update to authenticated using (
-  workspace_id in (
-    select id from workspaces where owner_id = auth.uid()
-    union
-    select workspace_id from workspace_members where user_id = auth.uid()
-  )
-);
-create policy "tasks_delete" on tasks for delete to authenticated using (
-  workspace_id in (
-    select id from workspaces where owner_id = auth.uid()
-    union
-    select workspace_id from workspace_members where user_id = auth.uid()
-  )
-);
+-- workspaces
+DROP POLICY IF EXISTS workspaces_select ON workspaces;
+DROP POLICY IF EXISTS workspaces_insert ON workspaces;
+DROP POLICY IF EXISTS workspaces_update ON workspaces;
+DROP POLICY IF EXISTS workspaces_delete ON workspaces;
 
--- Task assignees
-create policy "ta_select" on task_assignees for select to authenticated using (
-  task_id in (
-    select id from tasks where workspace_id in (
-      select id from workspaces where owner_id = auth.uid()
-      union
-      select workspace_id from workspace_members where user_id = auth.uid()
+CREATE POLICY workspaces_select ON workspaces
+  FOR SELECT TO authenticated USING (
+    owner_id = auth.uid()
+    OR id IN (
+      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
     )
-  )
-);
-create policy "ta_insert" on task_assignees for insert to authenticated with check (
-  task_id in (
-    select id from tasks where workspace_id in (
-      select id from workspaces where owner_id = auth.uid()
-      union
-      select workspace_id from workspace_members where user_id = auth.uid()
+  );
+
+CREATE POLICY workspaces_insert ON workspaces
+  FOR INSERT TO authenticated WITH CHECK (owner_id = auth.uid());
+
+CREATE POLICY workspaces_update ON workspaces
+  FOR UPDATE TO authenticated USING (owner_id = auth.uid());
+
+CREATE POLICY workspaces_delete ON workspaces
+  FOR DELETE TO authenticated USING (owner_id = auth.uid());
+
+-- workspace_members
+DROP POLICY IF EXISTS wm_select ON workspace_members;
+DROP POLICY IF EXISTS wm_insert ON workspace_members;
+DROP POLICY IF EXISTS wm_delete ON workspace_members;
+
+CREATE POLICY wm_select ON workspace_members
+  FOR SELECT TO authenticated USING (
+    user_id = auth.uid()
+    OR workspace_id IN (
+      SELECT workspace_id FROM workspace_members wm2 WHERE wm2.user_id = auth.uid()
     )
-  )
-);
-create policy "ta_delete" on task_assignees for delete to authenticated using (
-  task_id in (
-    select id from tasks where workspace_id in (
-      select id from workspaces where owner_id = auth.uid()
-      union
-      select workspace_id from workspace_members where user_id = auth.uid()
+  );
+
+CREATE POLICY wm_insert ON workspace_members
+  FOR INSERT TO authenticated WITH CHECK (user_id = auth.uid());
+
+CREATE POLICY wm_delete ON workspace_members
+  FOR DELETE TO authenticated USING (
+    user_id = auth.uid()
+    OR workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
     )
-  )
-);
+  );
 
+-- tasks
+DROP POLICY IF EXISTS tasks_select ON tasks;
+DROP POLICY IF EXISTS tasks_insert ON tasks;
+DROP POLICY IF EXISTS tasks_update ON tasks;
+DROP POLICY IF EXISTS tasks_delete ON tasks;
+
+CREATE POLICY tasks_select ON tasks
+  FOR SELECT TO authenticated USING (
+    workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
+      UNION
+      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+    )
+  );
+
+CREATE POLICY tasks_insert ON tasks
+  FOR INSERT TO authenticated WITH CHECK (
+    workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
+      UNION
+      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+    )
+  );
+
+CREATE POLICY tasks_update ON tasks
+  FOR UPDATE TO authenticated USING (
+    workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
+      UNION
+      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+    )
+  );
+
+CREATE POLICY tasks_delete ON tasks
+  FOR DELETE TO authenticated USING (
+    workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
+      UNION
+      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+    )
+  );
+
+-- task_assignees
+DROP POLICY IF EXISTS ta_select ON task_assignees;
+DROP POLICY IF EXISTS ta_insert ON task_assignees;
+DROP POLICY IF EXISTS ta_delete ON task_assignees;
+
+CREATE POLICY ta_select ON task_assignees
+  FOR SELECT TO authenticated USING (
+    task_id IN (
+      SELECT id FROM tasks WHERE workspace_id IN (
+        SELECT id FROM workspaces WHERE owner_id = auth.uid()
+        UNION
+        SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+      )
+    )
+  );
+
+CREATE POLICY ta_insert ON task_assignees
+  FOR INSERT TO authenticated WITH CHECK (
+    task_id IN (
+      SELECT id FROM tasks WHERE workspace_id IN (
+        SELECT id FROM workspaces WHERE owner_id = auth.uid()
+        UNION
+        SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+      )
+    )
+  );
+
+CREATE POLICY ta_delete ON task_assignees
+  FOR DELETE TO authenticated USING (
+    task_id IN (
+      SELECT id FROM tasks WHERE workspace_id IN (
+        SELECT id FROM workspaces WHERE owner_id = auth.uid()
+        UNION
+        SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+      )
+    )
+  );
+
+-- Step 6: Functions (security definer — bypass RLS for invite flow)
 -- ============================================================
--- FUNCTIONS
--- ============================================================
 
--- Auto-create profile on signup
-create or replace function handle_new_user()
-returns trigger as $$
-begin
-  insert into profiles (id, name)
-  values (
-    new.id,
-    coalesce(new.raw_user_meta_data->>'name', split_part(new.email, '@', 1))
-  )
-  on conflict (id) do nothing;
-  return new;
-end;
-$$ language plpgsql security definer;
+-- Returns workspace info by invite token (no auth required for the lookup itself)
+CREATE OR REPLACE FUNCTION get_workspace_by_token(p_token text)
+RETURNS TABLE(id uuid, name text, description text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  RETURN QUERY
+    SELECT w.id, w.name, w.description
+    FROM workspaces w
+    WHERE w.invite_token = p_token;
+END;
+$$;
 
-create trigger on_auth_user_created
-  after insert on auth.users
-  for each row execute procedure handle_new_user();
-
--- Auto-add creator as workspace owner-member
-create or replace function handle_new_workspace()
-returns trigger as $$
-begin
-  insert into workspace_members (workspace_id, user_id, role)
-  values (new.id, new.owner_id, 'owner')
-  on conflict (workspace_id, user_id) do nothing;
-  return new;
-end;
-$$ language plpgsql security definer;
-
-create trigger on_workspace_created
-  after insert on workspaces
-  for each row execute procedure handle_new_workspace();
-
--- Look up workspace by invite token (bypasses RLS for the lookup)
-create or replace function get_workspace_by_token(p_token text)
-returns table(id uuid, name text, description text) as $$
-begin
-  return query
-    select w.id, w.name, w.description
-    from workspaces w
-    where w.invite_token = p_token;
-end;
-$$ language plpgsql security definer;
-
--- Join a workspace via invite token
-create or replace function join_workspace_by_token(p_token text)
-returns uuid as $$
-declare
+-- Adds calling user to workspace via invite token
+CREATE OR REPLACE FUNCTION join_workspace_by_token(p_token text)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
   v_workspace_id uuid;
-begin
-  select w.id into v_workspace_id
-  from workspaces w
-  where w.invite_token = p_token;
+BEGIN
+  SELECT w.id INTO v_workspace_id
+  FROM workspaces w
+  WHERE w.invite_token = p_token;
 
-  if v_workspace_id is null then
-    raise exception 'Invalid invite token';
-  end if;
+  IF v_workspace_id IS NULL THEN
+    RAISE EXCEPTION 'Invalid invite token';
+  END IF;
 
-  insert into workspace_members (workspace_id, user_id, role)
-  values (v_workspace_id, auth.uid(), 'member')
-  on conflict (workspace_id, user_id) do nothing;
+  INSERT INTO workspace_members (workspace_id, user_id, role)
+  VALUES (v_workspace_id, auth.uid(), 'member')
+  ON CONFLICT (workspace_id, user_id) DO NOTHING;
 
-  return v_workspace_id;
-end;
-$$ language plpgsql security definer;
+  RETURN v_workspace_id;
+END;
+$$;
+
+-- Step 7: Triggers
+-- ============================================================
+
+-- Auto-create profile row when a user signs up
+CREATE OR REPLACE FUNCTION handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  INSERT INTO profiles (id, name)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'name', split_part(NEW.email, '@', 1))
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE handle_new_user();
+
+-- Auto-add workspace creator as owner-member
+CREATE OR REPLACE FUNCTION handle_new_workspace()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  INSERT INTO workspace_members (workspace_id, user_id, role)
+  VALUES (NEW.id, NEW.owner_id, 'owner')
+  ON CONFLICT (workspace_id, user_id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_workspace_created
+  AFTER INSERT ON workspaces
+  FOR EACH ROW EXECUTE PROCEDURE handle_new_workspace();
